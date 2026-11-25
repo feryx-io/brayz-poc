@@ -229,3 +229,9 @@ needs Deepgram and Anthropic API keys.
 - [`docs/operations/`](./docs/operations) — per-feature notes: delivery orders,
   changing an order, closed hours and scheduling, call recordings, SMS consent,
   billing, insights, the staff admin portal, Firebase auth, SIP capture.
+
+## License
+
+Copyright © 2026 Feryx. All rights reserved. This repository is published for
+reference and evaluation only; no license to use, copy, modify or distribute it
+is granted. See [`LICENSE`](./LICENSE).
