@@ -1,0 +1,158 @@
+# SiphonAI config for the Brayz voice node — RENDERED BY TERRAFORM.
+#
+# Source of truth: infra/terraform/modules/siphon-node/config.toml.tftpl.
+# The startup script writes this to /etc/siphon-ai/config.toml on every boot,
+# so edits made on the box are overwritten. Change the template and re-apply.
+#
+# The local-lab counterpart is infra/local/siphon-ai.lab.toml: same bridge,
+# reached from a LAN softphone instead of Twilio's trunk.
+
+[node]
+id = "${node_id}"
+# The reserved static IP, kept across a down.sh pause so the Twilio origination
+# URI never changes. Stamped on Contact and the SDP c= line, so it must be the
+# public address rather than the VM's internal interface.
+public_address = "${public_address}"
+
+[sip]
+# Bind the wildcard so the kernel picks the route back to Twilio's source IP;
+# Contact is synthesized from public_address + this port.
+listen = "0.0.0.0:${sip_port}"
+transports = ["udp"]
+user_agent = "SiphonAI/${node_id}"
+
+[media]
+# PCMU is Twilio Elastic SIP Trunking's default, PCMA covers EU routes. The
+# bridge transcodes to the PCM16LE the Orchestrator's media server expects.
+codecs = ["pcmu", "pcma"]
+dtmf = "rfc2833"
+# Silero rather than the energy detector. A real handset in a real room fires
+# speech_started constantly on "energy", which the Orchestrator reads as
+# barge-in — the defect class that made the first live calls unusable.
+vad = "neural"
+# Rendered from the same variables as the firewall rule, so the two cannot
+# disagree. If they ever did, calls would set up normally on SIP and then carry
+# no audio, because only the media is dropped — a failure that looks like a
+# codec or bridge fault and is neither.
+rtp_port_range = [${rtp_port_min}, ${rtp_port_max}]
+
+[bridge]
+# The Orchestrator's media WebSocket server on Cloud Run — wss on 443, since
+# Cloud Run terminates TLS. Rendered from the service's own URI, which changes
+# whenever the service is recreated. `?node=` names this node on every call it
+# bridges — SiphonAI's `start` message does not say which node sent it — which
+# is how the staff portal counts live calls per node.
+ws_url = "${ws_url}?node=${node_id}"
+ws_connect_timeout_ms = 3000
+# Cold STT/LLM/TTS on a scale-from-zero Cloud Run instance can exceed the 5 s
+# default before the greeting's first frame lands. min_instances = 0 is the
+# money-saving default, so treat a cold start as normal rather than a fault.
+server_start_deadline_secs = 15
+# Checked by the Orchestrator at the HTTP upgrade; a mismatch is a 401 and the
+# call never reaches the start handshake. Expanded from the daemon environment
+# (/etc/siphon-ai/env), which the startup script fills from Secret Manager, so
+# the secret is never in this file or in Terraform state.
+ws_auth_header = "Bearer $${BRAYZ_NODE_SHARED_SECRET}"
+
+# Hold a speech_started for 200 ms during playout and treat it as barge-in only
+# if the speech sustains. The Orchestrator has its own provisional barge-in on
+# top of this; this one keeps the cheapest noise off the wire entirely.
+[bridge.barge_in]
+debounce_ms = 200
+
+# Lifecycle events to the Brayz API. The one that matters today is
+# recording_uploaded: SiphonAI records on the node and uploads afterwards, so
+# "recorded" and "playable" are different states, and without this the call
+# record never learns the recording arrived.
+#
+# Signed, because the API verifies X-SiphonAI-Signature and refuses anything
+# else — the secret is the same brayz-<env>-siphon-webhook-secret the API reads,
+# supplied from the daemon environment rather than written here.
+#
+# The spool is what makes this survive the API being down or redeployed: a
+# failed delivery is persisted and retried by a worker that outlives a restart,
+# instead of being dropped after retry_max. Deliveries carry a stable
+# X-SiphonAI-Event-Id across retries, and the API is idempotent on it.
+[webhooks]
+enabled = true
+url = "${api_url}/v1/webhooks/siphon"
+secret = "$${SIPHON_WEBHOOK_SECRET}"
+events = ["recording_uploaded"]
+spool_dir = "/var/lib/siphon-ai/webhook-spool"
+
+%{ if recording.enabled ~}
+# Record every call: stereo WAV (L = caller, R = bot) on local disk, uploaded to
+# the bucket when the call finalizes, local copy deleted after a durable upload,
+# arrival confirmed by the recording_uploaded webhook above. WAV rather than
+# Opus because every browser plays it from a plain <audio> element, which is how
+# the Calls screen plays it back; ~2 MB per minute at 8 kHz.
+#
+# Deliberately NOT sealed with [recording.encryption]: the API's playback path
+# is a signed URL straight to the object, which a browser cannot decrypt. The
+# bucket is private (public access prevention enforced), the object is served
+# only through a 5-minute signed URL, and every access is audited (rule #6).
+# GCS encrypts at rest with Google-managed keys. Revisit if recordings ever
+# leave GCP or a decrypting playback proxy is built.
+[recording]
+mode   = "always"
+format = "wav"
+dir    = "/var/lib/siphon-ai/recordings"
+
+# GCS through its S3-interoperability endpoint with an HMAC key minted for the
+# node's own service account, which the bucket lets create objects and nothing
+# else. Credentials come from the daemon environment, filled from Secret
+# Manager at boot — never from this file.
+[recording.storage]
+enabled      = true # recording-storage
+endpoint     = "${recording.endpoint}"
+bucket       = "${recording.bucket}"
+region       = "${recording.region}"
+access_key   = "$${RECORDING_S3_ACCESS_KEY}"
+secret_key   = "$${RECORDING_S3_SECRET_KEY}"
+key_template = "{date}/{call_id}"
+delete_local_after_upload = true
+# Under /var/lib/siphon-ai because the unit's ProtectSystem=strict makes
+# everything else read-only; the docs' /var/spool path would fail at startup.
+spool_dir    = "/var/lib/siphon-ai/upload-spool"
+
+%{ endif ~}
+%{ if hep.enabled ~}
+# HEP3 to Homer. The password is HEP chunk 0x0011, supplied by systemd from the
+# EnvironmentFile — never written into this file.
+[hep]
+enabled          = true
+collector        = "${hep.collector}"
+capture_id       = ${hep.capture_id}
+capture_password = "$${HEP_PASSWORD}"
+queue_capacity   = 256
+
+%{ endif ~}
+[observability]
+enabled = true
+# Loopback only: the VM has a public IP and no firewall rule for this port, but
+# binding the wildcard would still be a needless exposure. Reach it over SSH:
+#   gcloud compute ssh ${node_id} --tunnel-through-iap \
+#     --command='curl -s localhost:9091/metrics | grep siphon_ai_calls'
+http_listen = "127.0.0.1:9091"
+
+# Pin inbound SIP to Twilio. Rendered from the same ranges as the firewall, so
+# this is defence in depth rather than a second list to keep in step: the static
+# IP is public, and an unpinned daemon bridges anyone who finds it straight to
+# the bot, on our Anthropic and Deepgram spend.
+[[trunk]]
+name = "twilio"
+peer_addrs = [
+%{ for cidr in twilio_sip_ranges ~}
+  "${cidr}",
+%{ endfor ~}
+]
+
+# One route: every accepted INVITE bridges to ws_url above. Brayz is
+# multi-tenant, but the fan-out happens in the Orchestrator, which resolves
+# tenant and location from the dialled number (start.to -> POST /v1/calls) —
+# not in the dialplan. Matching tenants here would put routing in two places
+# and let them disagree.
+[[route]]
+name = "brayz-ai"
+[route.match]
+any = true

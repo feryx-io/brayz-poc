@@ -1,0 +1,1120 @@
+// Brayz Prisma schema — Cloud SQL PostgreSQL is the system of record.
+// RULES (CLAUDE.md): everything is tenant-scoped; Redis holds only ephemeral
+// state, never anything modeled here. Money is stored as integer cents.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// ----------------------------------------------------------------------------
+// Platform
+// ----------------------------------------------------------------------------
+
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  // The account's free trial: Pro on every location until trialEndsAt, set at
+  // sign-up (TRIAL_DAYS). Null on accounts from before trials existed, which
+  // keep the unrestricted access they always had. Staff extend it from the
+  // admin portal; each change is in platform_audit_logs (admin.trial.*).
+  trialStartedAt DateTime?
+  trialEndsAt    DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  locations       Location[]
+  memberships     UserTenantMembership[]
+  guests          Guest[]
+  calls           Call[]
+  orders          Order[]
+  auditLogs       AuditLog[]
+  menuGaps        MenuGap[]
+  callMessages    CallMessage[]
+  supportRequests SupportRequest[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  // External identity provider subject (Firebase / Identity Platform / Clerk).
+  authSubject  String   @unique
+  email        String   @unique
+  displayName  String?
+  // Brayz staff, not a restaurant's user: "support" (read the admin portal) or
+  // "admin" (also change support requests and promote other staff). Null for
+  // every customer, which is almost everyone — this is the ONLY thing that
+  // opens the cross-tenant admin surface, so it is never set by self-service.
+  platformRole String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships     UserTenantMembership[]
+  supportRequests SupportRequest[]
+
+  @@map("users")
+}
+
+model UserTenantMembership {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  userId     String   @db.Uuid
+  // Role within the tenant: owner | manager | staff | admin
+  role       String
+  // Optional location scoping; null = all locations in the tenant.
+  locationId String?  @db.Uuid
+  createdAt  DateTime @default(now())
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, userId, locationId])
+  @@index([userId])
+  @@map("user_tenant_memberships")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String?  @db.Uuid
+  actorId    String?  @db.Uuid
+  // e.g. guest_profile.accessed, recording.played, consent.changed, price.changed
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Locations & configuration
+// ----------------------------------------------------------------------------
+
+model Location {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  name              String
+  timezone          String   @default("America/New_York")
+  addressLine1      String?
+  addressLine2      String?
+  city              String?
+  region            String?
+  postalCode        String?
+  mainPhone         String?
+  escalationPhone   String?
+  // SMS destination for order-confirmation texts; falls back to mainPhone.
+  notificationPhone String?
+  pickupEnabled     Boolean  @default(true)
+  deliveryEnabled   Boolean  @default(false)
+  // What the bot quotes when an order is placed ("about 20 minutes").
+  pickupEtaMinutes   Int     @default(20)
+  deliveryEtaMinutes Int     @default(45)
+  // Delivery pricing, added by the API (rule #5); 0 = none.
+  deliveryFeeCents     Int   @default(0)
+  deliveryMinimumCents Int   @default(0)
+  // Delivery area: an address qualifies if it is within the radius OR its ZIP
+  // is listed; set neither and there is no area check (lib/delivery.ts).
+  deliveryRadiusMiles Float?
+  deliveryZipCodes    String[] @default([])
+  // The restaurant's own position for the radius, geocoded from its address.
+  latitude  Float?
+  longitude Float?
+  // The owner's opening lines, spoken word for word; several so a regular
+  // hears something a little different each call. Empty = the default line.
+  aiGreetings       String[] @default([])
+  // How a recognized regular is welcomed before the greeting ("{guest_name}"
+  // is their name). Empty = the built-in variants.
+  welcomeBackLines  String[] @default([])
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  tenant          Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships     UserTenantMembership[]
+  hours           LocationHours[]
+  holidayHours    LocationHolidayHours[]
+  aiSettings      LocationAiSettings?
+  loyaltySettings LocationLoyaltySettings?
+  phoneNumbers    PhoneNumber[]
+  menus           Menu[]
+  guests          Guest[]
+  calls           Call[]
+  orders          Order[]
+  transferTargets LocationTransferTarget[]
+  menuGaps        MenuGap[]
+  staff           StaffProfile[]
+  posIntegration  PosIntegration?
+  promotions      Promotion[]
+  subscription    LocationSubscription?
+  callMessages    CallMessage[]
+  supportRequests SupportRequest[]
+
+  @@index([tenantId])
+  @@map("locations")
+}
+
+// Named destinations the AI can transfer a caller to (REFER). Multiple per
+// location — e.g. a manager, the owner by name, or "a human to take my order".
+// The LLM picks one by `key` based on caller intent (CLAUDE.md rule #5: routing
+// is data, not prompt). `destination` is a sip:/sips: URI, or a phone/extension
+// the API turns into a URI with BRAYZ_TRANSFER_SIP_DOMAIN.
+model LocationTransferTarget {
+  id          String   @id @default(uuid()) @db.Uuid
+  locationId  String   @db.Uuid
+  key         String // stable slug the LLM selects, e.g. "manager", "bob", "ordering"
+  label       String // spoken/display name, e.g. "Bob (owner)", "a manager"
+  description String? // when to use it — helps the LLM match caller intent
+  destination String // sip:user@host, or an E.164/extension
+  enabled     Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, key])
+  @@index([locationId])
+  @@map("location_transfer_targets")
+}
+
+model LocationHolidayHours {
+  id         String   @id @default(uuid()) @db.Uuid
+  locationId String   @db.Uuid
+  date       DateTime @db.Date
+  closed     Boolean  @default(true)
+  opensAt    Int? // minutes from midnight, local tz (null when closed)
+  closesAt   Int?
+  label      String?
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, date])
+  @@map("location_holiday_hours")
+}
+
+model LocationAiSettings {
+  id                     String  @id @default(uuid()) @db.Uuid
+  locationId             String  @unique @db.Uuid
+  // Transfer/escalation rules used by the Orchestrator.
+  transferEnabled        Boolean @default(true)
+  transferWhenOpen       Boolean @default(true)
+  offerMessageWhenClosed Boolean @default(true)
+  maxCallSeconds         Int     @default(600)
+  voicePersona           String?
+  // Guest-memory personalization posture: full | confirm | off (CLAUDE.md rule #6).
+  guestMemoryMode        String  @default("full")
+  // Which voice answers calls: default (built-in voicePersona) | fixed (one
+  // staff voice) | rotate (cycle the rotation-enabled staff voices daily).
+  voiceMode              String  @default("default")
+  fixedVoiceProfileId    String? @db.Uuid
+  // In rotate mode, how often the voice changes: daily | per_call (round robin
+  // through the rotation-enabled voices, one step per call).
+  voiceRotation          String  @default("daily")
+  // May a caller ask for a staff persona by name and have the call handed to
+  // that voice mid-call? Off by default: a persona in a real employee's cloned
+  // voice saying "this is Jose" is a deliberate choice, not a default.
+  personaSwitchEnabled   Boolean @default(false)
+  // The built-in voice when no staff voice answers: a provider voice id
+  // (e.g. a Deepgram Aura model) and the name it introduces itself with.
+  defaultVoiceId         String?
+  assistantName          String?
+  // How each item is confirmed as it goes on the order: fast | natural.
+  // "fast" has the engine speak a fixed line from what the tool actually did,
+  // which ends the turn there. "natural" spends a second model round trip
+  // letting it phrase the confirmation itself — warmer, and measured at about
+  // a second and a half more silence per item on a real call.
+  orderAckMode           String  @default("fast")
+  // What the bot does when the restaurant is shut: take_orders (answer as if
+  // open, which is all it ever did) | announce (say it is closed and when it
+  // opens next, then take a message or an order for later).
+  closedBehavior         String  @default("take_orders")
+  // May a caller order ahead for a later time — both when closed and while
+  // open ("can I pick that up at six?"). Off until an owner turns it on.
+  scheduleOrdersEnabled  Boolean @default(false)
+  // How far ahead a scheduled order may be placed, in days past today. 0 is
+  // today only; the default covers the two cases that matter — later today,
+  // and tomorrow morning for a call that comes in overnight.
+  scheduleMaxDaysAhead   Int     @default(1)
+  // Offer callers a text when their order is ready, and send it when the order
+  // is marked ready — only to a caller who said yes to the spoken disclosure
+  // (sms_consent_records, purpose guest_order_updates). Off until turned on.
+  guestOrderTextsEnabled Boolean @default(false)
+  // How many days a call recording is kept before the retention sweep deletes
+  // it from object storage. Null means no per-location policy: the recording
+  // stays until the bucket's own lifecycle rule (the platform ceiling) removes
+  // it. A location can only shorten that ceiling, never extend it.
+  recordingRetentionDays Int?
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@map("location_ai_settings")
+}
+
+// Something a caller asked for that the menu does not sell.
+//
+// One row per asking, not a running count: a restaurant deciding whether to put
+// ketchup on the menu wants to know it was ten people this week and not one
+// person ten times last winter, and the call it came from is the only way to
+// check what was really meant. Aggregated at read time.
+model MenuGap {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String   @db.Uuid
+  callId     String?  @db.Uuid
+  // "item" — they asked for a thing that is not on the menu at all.
+  // "option" — the thing exists, but not that choice on it (the ranch case).
+  kind       String
+  // Lowercased and stripped, so ten spellings of one word count as ten asks.
+  term       String
+  // What was actually heard, kept for the one the dashboard shows.
+  rawTerm    String
+  // The item the option was asked for on, when kind is "option".
+  onItem     String?
+  createdAt  DateTime @default(now())
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  call     Call?    @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, locationId, createdAt])
+  @@index([locationId, term])
+  @@map("menu_gaps")
+}
+
+// A message a caller left for the restaurant: who, how to reach them, and
+// what they said. Taken by the bot when the caller asks for a person it
+// cannot transfer to, wants a callback, or brings something it cannot handle
+// (a complaint, catering, a job). The restaurant is texted when one lands
+// and works it off the Messages screen — `new` until someone marks it done.
+model CallMessage {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @db.Uuid
+  locationId     String    @db.Uuid
+  callId         String?   @db.Uuid
+  callerName     String?
+  callbackNumber String?
+  body           String
+  // new | done
+  status         String    @default("new")
+  // When the restaurant was texted about it; null if that failed or was off.
+  notifiedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  doneAt         DateTime?
+  doneById       String?   @db.Uuid
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  call     Call?    @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, locationId, status, createdAt])
+  @@map("call_messages")
+}
+
+model LocationHours {
+  id         String @id @default(uuid()) @db.Uuid
+  locationId String @db.Uuid
+  dayOfWeek  Int // 0 = Sunday
+  opensAt    Int // minutes from midnight, local tz
+  closesAt   Int
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([locationId, dayOfWeek])
+  @@map("location_hours")
+}
+
+// ----------------------------------------------------------------------------
+// Telephony / voice
+// ----------------------------------------------------------------------------
+
+model PhoneNumber {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @db.Uuid
+  locationId       String   @db.Uuid
+  e164Number       String   @unique
+  provider         String   @default("twilio")
+  providerNumberId String?
+  inboundRouteType String   @default("ai")
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, locationId])
+  @@map("phone_numbers")
+}
+
+model VoiceNode {
+  id          String   @id @default(uuid()) @db.Uuid
+  nodeId      String   @unique
+  region      String
+  environment String
+  publicIp    String?
+  // ready | draining | drained | unhealthy
+  status      String   @default("ready")
+  maxCalls    Int      @default(100)
+  activeCalls Int      @default(0)
+  lastSeenAt  DateTime @default(now())
+  // The node's latest self-report (`NodeHealthSnapshot` in @brayz/shared),
+  // overwritten by every heartbeat — the current state, not a history. It is
+  // here rather than in Redis (rule #3 lists node heartbeats there) because
+  // this row already carries lastSeenAt/activeCalls and Redis is not deployed;
+  // one small update per node every 30 s.
+  health      Json?
+  createdAt   DateTime @default(now())
+
+  @@map("voice_nodes")
+}
+
+model Call {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  locationId      String    @db.Uuid
+  guestId         String?   @db.Uuid
+  provider        String    @default("twilio")
+  providerCallId  String?
+  fromNumber      String?
+  toNumber        String?
+  // started | in_progress | transferred | completed | failed
+  status          String    @default("started")
+  startedAt       DateTime  @default(now())
+  answeredAt      DateTime?
+  endedAt         DateTime?
+  summary         String?
+  // Recording (SiphonAI records on the node; §3.11 lifecycle + the
+  // `recording_uploaded` webhook once the file reaches object storage).
+  // started | stopped | failed | uploaded | deleted
+  // `deleted` is the retention sweep's mark: the object is gone from storage
+  // and `recordingUrl` is cleared, but the fact that a recording once existed
+  // stays on the call (and in the audit log).
+  recordingStatus String?
+  recordingId     String?
+  recordingUrl    String?
+  // The SiphonAI node that bridged the call — its `[node].id`, sent as `?node=`
+  // on the media URL (or `ip:<address>` if it did not name itself). For the
+  // staff portal's live count per node. Null on calls from before it was
+  // recorded.
+  nodeId          String?
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location   Location        @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  guest      Guest?          @relation(fields: [guestId], references: [id], onDelete: SetNull)
+  events     CallEvent[]
+  transcript CallTranscript?
+  orders     Order[]
+  menuGaps   MenuGap[]
+  messages   CallMessage[]
+
+  @@index([tenantId, locationId, startedAt])
+  @@index([providerCallId])
+  // The staff portal's cross-tenant reads: live calls, and volume over time.
+  @@index([startedAt])
+  @@map("calls")
+}
+
+model CallEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  callId     String   @db.Uuid
+  eventType  String
+  occurredAt DateTime @default(now())
+  payload    Json     @default("{}")
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId, occurredAt])
+  @@map("call_events")
+}
+
+model CallTranscript {
+  id        String   @id @default(uuid()) @db.Uuid
+  callId    String   @unique @db.Uuid
+  // Turn-level structured transcript: [{ speaker, text, startedAt, endedAt, confidence }]
+  turns     Json     @default("[]")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@map("call_transcripts")
+}
+
+// ----------------------------------------------------------------------------
+// Menu
+// ----------------------------------------------------------------------------
+
+model Menu {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String   @db.Uuid
+  name       String   @default("Main Menu")
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location   Location       @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  categories MenuCategory[]
+
+  @@index([tenantId, locationId])
+  @@map("menus")
+}
+
+model MenuCategory {
+  id        String   @id @default(uuid()) @db.Uuid
+  menuId    String   @db.Uuid
+  name      String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  menu  Menu       @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  items MenuItem[]
+
+  @@index([menuId])
+  @@map("menu_categories")
+}
+
+model MenuItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  categoryId  String   @db.Uuid
+  name        String
+  description String?
+  priceCents  Int
+  available   Boolean  @default(true)
+  upsellTags  String[] @default([])
+  // Optional ingredient list so the bot can answer "does X have cucumbers?" from
+  // real data — it never invents ingredients (enforced in the orchestrator prompt).
+  ingredients String[] @default([])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  category       MenuCategory    @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  modifierGroups ModifierGroup[]
+
+  @@index([categoryId])
+  @@map("menu_items")
+}
+
+model ModifierGroup {
+  id            String  @id @default(uuid()) @db.Uuid
+  menuItemId    String  @db.Uuid
+  name          String
+  // single | multi
+  selectionType String
+  required      Boolean @default(false)
+  minSelections Int     @default(0)
+  maxSelections Int?
+  // Half-and-half: a caller may put an option on one half of the item only
+  // ("half pepperoni, half sausage"). On by default for topping groups on
+  // pizzas (see defaultAllowsHalves in @brayz/shared); a calzone or a sub is
+  // one thing and stays off. halfPricing says what a half costs: full — the
+  // whole topping price, the common pizzeria rule — or half of it.
+  allowsHalves  Boolean @default(false)
+  halfPricing   String  @default("full")
+
+  menuItem  MenuItem   @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  modifiers Modifier[]
+
+  @@index([menuItemId])
+  @@map("menu_modifier_groups")
+}
+
+model Modifier {
+  id              String  @id @default(uuid()) @db.Uuid
+  modifierGroupId String  @db.Uuid
+  name            String
+  priceCents      Int     @default(0)
+  available       Boolean @default(true)
+
+  group ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  @@index([modifierGroupId])
+  @@map("menu_modifiers")
+}
+
+// ----------------------------------------------------------------------------
+// Guests
+// ----------------------------------------------------------------------------
+
+model Guest {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  locationId    String?  @db.Uuid
+  displayName   String?
+  // Guest memory is opt-out; disabling stops personalization for this guest.
+  memoryEnabled Boolean  @default(true)
+  notes         String?
+  // Birthday month/day only (no year — privacy-light), for the birthday offer.
+  birthdayMonth Int?
+  birthdayDay   Int?
+  // Where their last delivery went (a DeliveryAddress), offered next time. Guest
+  // memory like the rest of this row: saved only while memory is on, never read
+  // out on a caller-id match alone in confirm mode (rule #6), editable and
+  // removable from the dashboard.
+  deliveryAddress          Json?
+  deliveryAddressUpdatedAt DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location     Location?          @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  phoneNumbers GuestPhoneNumber[]
+  calls        Call[]
+  orders       Order[]
+  loyalty      LoyaltyAccount?
+
+  @@index([tenantId, locationId])
+  @@map("guests")
+}
+
+model GuestPhoneNumber {
+  id        String   @id @default(uuid()) @db.Uuid
+  guestId   String   @db.Uuid
+  tenantId  String   @db.Uuid
+  e164      String
+  createdAt DateTime @default(now())
+
+  guest Guest @relation(fields: [guestId], references: [id], onDelete: Cascade)
+
+  // Phone uniqueness is tenant-scoped (CLAUDE.md / dev plan §8).
+  @@unique([tenantId, e164])
+  @@index([guestId])
+  @@map("guest_phone_numbers")
+}
+
+// ----------------------------------------------------------------------------
+// Orders
+// ----------------------------------------------------------------------------
+
+model Order {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  locationId      String   @db.Uuid
+  callId          String?  @db.Uuid
+  guestId         String?  @db.Uuid
+  // pickup | delivery
+  fulfillmentType String   @default("pickup")
+  // Delivery orders only: where it goes (a DeliveryAddress snapshot, so a later
+  // edit to the guest's saved address never rewrites an order), the fee the API
+  // added to the total (rule #5), and how the address met the delivery area
+  // (no_rules | in_zip | in_radius | unverified — unverified is flagged on the ticket).
+  deliveryAddress   Json?
+  deliveryFeeCents  Int     @default(0)
+  deliveryAreaCheck String?
+  // What was taken off the food when the order was placed — a loyalty reward
+  // plus any promotion. Kept as granted, so a change that shrinks the food
+  // below it and a later one that adds back get the whole of it again.
+  discountCents   Int      @default(0)
+  // When the caller asked for it, as an instant. Null is the ordinary case:
+  // as soon as it can be made. A scheduled order goes to the kitchen straight
+  // away with the time on the ticket, the way a call-ahead always has.
+  scheduledFor    DateTime?
+  // draft | confirmed | accepted | ready | completed | canceled | failed
+  status          String   @default("confirmed")
+  revision        Int      @default(0)
+  customerName    String?
+  customerPhone   String?
+  subtotalCents   Int      @default(0)
+  taxCents        Int?
+  totalCents      Int      @default(0)
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location      @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  call     Call?         @relation(fields: [callId], references: [id], onDelete: SetNull)
+  guest    Guest?        @relation(fields: [guestId], references: [id], onDelete: SetNull)
+  items    OrderItem[]
+  posSync  PosOrderSync?
+
+  @@index([tenantId, locationId, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                  String  @id @default(uuid()) @db.Uuid
+  orderId             String  @db.Uuid
+  menuItemId          String? @db.Uuid
+  name                String
+  quantity            Int     @default(1)
+  unitPriceCents      Int
+  specialInstructions String?
+  /// The guest took an add-on the bot suggested. Set by the Orchestrator from
+  /// what `suggest_upsell` actually returned — not from the model's own claim —
+  /// so "upsell revenue" means the same thing every time.
+  viaUpsell           Boolean @default(false)
+
+  order     Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  modifiers OrderItemModifier[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+model OrderItemModifier {
+  id          String  @id @default(uuid()) @db.Uuid
+  orderItemId String  @db.Uuid
+  modifierId  String? @db.Uuid
+  name        String
+  priceCents  Int     @default(0)
+  // Which part of the item it goes on: whole | left | right. What the kitchen
+  // needs for a half-and-half pizza, and what priceCents was computed for.
+  portion     String  @default("whole")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId])
+  @@map("order_item_modifiers")
+}
+
+// ----------------------------------------------------------------------------
+// Staff voices (Phase 7: consent-gated voice personas — CLAUDE.md rule #6)
+// ----------------------------------------------------------------------------
+
+model StaffProfile {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String   @db.Uuid
+  name       String
+  role       String?
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location       Location             @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  voiceProfiles  StaffVoiceProfile[]
+  consentRecords VoiceConsentRecord[]
+
+  @@index([tenantId, locationId])
+  @@map("staff_profiles")
+}
+
+// A cloned/approved voice for one staff member. The provider voice id lives
+// here, separate from consent records and (later) raw voice assets, per the
+// implementation plan §12.2.
+model StaffVoiceProfile {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @db.Uuid
+  staffProfileId     String   @db.Uuid
+  label              String
+  // pending | ready | revoked
+  status             String   @default("pending")
+  // clone — a real person's voice, consent-gated (rule #6) and retired on
+  // revocation; provider — a catalog voice from the TTS vendor assigned to
+  // this persona, which needs no consent and survives a revocation.
+  source             String   @default("clone")
+  provider           String?
+  providerVoiceId    String?
+  enabledForRotation Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  staff StaffProfile @relation(fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  @@index([staffProfileId])
+  @@map("staff_voice_profiles")
+}
+
+// Append-only ledger of consent to receive texts (rule #6). The current state
+// for a location + phone + purpose is its newest record: granted (box checked,
+// confirmation text sent) → confirmed (replied YES; texts may go) → revoked
+// (STOP, or turned off). Nothing is ever updated or deleted: what a person
+// agreed to, when, and in which words stays provable.
+model SmsConsentRecord {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  locationId        String   @db.Uuid
+  // E.164
+  phone             String
+  // restaurant_alerts | guest_order_updates
+  purpose           String
+  // granted | confirmed | revoked
+  action            String
+  // dashboard | sms_reply | voice_call
+  source            String
+  disclosureVersion String
+  // The exact words shown or sent, as agreed to.
+  disclosureText    String
+  // Who checked the box (dashboard), and from where.
+  actorUserId       String?  @db.Uuid
+  ipAddress         String?
+  userAgent         String?
+  // For a text reply: the provider's message id and what they wrote. For a
+  // spoken agreement on a call: the caller's words, the call, and the order the
+  // yes was given for — the offer says "about this order", so it covers that one.
+  providerMessageId String?
+  replyText         String?
+  callId            String?  @db.Uuid
+  orderId           String?  @db.Uuid
+  createdAt         DateTime @default(now())
+
+  @@index([tenantId, locationId, phone, purpose, createdAt])
+  @@index([tenantId, phone, createdAt])
+  @@map("sms_consent_records")
+}
+
+// Append-only consent ledger: cloning requires an explicit, recorded grant, and
+// staff can revoke at any time. Current consent = the latest record's action.
+model VoiceConsentRecord {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @db.Uuid
+  staffProfileId   String   @db.Uuid
+  // granted | revoked
+  action           String
+  // How consent was captured: dashboard | paper | recorded_call
+  source           String
+  notes            String?
+  recordedByUserId String?  @db.Uuid
+  createdAt        DateTime @default(now())
+
+  staff StaffProfile @relation(fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  @@index([staffProfileId, createdAt])
+  @@map("voice_consent_records")
+}
+
+// ----------------------------------------------------------------------------
+// Loyalty (Phase 6 MVP: points per dollar on confirmed orders + a flat reward)
+// ----------------------------------------------------------------------------
+
+// Per-location program config. Disabled by default — enabling is a deliberate
+// dashboard action (implementation plan §12.1). VIP tiers, birthday offers, and
+// win-back campaigns are later phases.
+model LocationLoyaltySettings {
+  id                  String  @id @default(uuid()) @db.Uuid
+  locationId          String  @unique @db.Uuid
+  enabled             Boolean @default(false)
+  // Earn rate: points per whole dollar of a confirmed order's total.
+  pointsPerDollar     Int     @default(10)
+  // Redemption rule: rewardPoints buys rewardCents off a pickup order.
+  rewardPoints        Int     @default(500)
+  rewardCents         Int     @default(500)
+  // VIP rule: lifetime spend >= vipSpendCents makes a guest VIP (computed, not
+  // stored); VIPs earn at pointsPerDollar * vipPointsMultiplier.
+  vipEnabled          Boolean @default(false)
+  vipSpendCents       Int     @default(50000)
+  vipPointsMultiplier Int     @default(2)
+  // Birthday offer: bonus points on the first confirmed order in the guest's
+  // birthday month, at most once per calendar year.
+  birthdayEnabled     Boolean @default(false)
+  birthdayBonusPoints Int     @default(200)
+  // Win-back: bonus points on the first order after >= winbackDays inactive.
+  winbackEnabled      Boolean @default(false)
+  winbackDays         Int     @default(60)
+  winbackBonusPoints  Int     @default(200)
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@map("location_loyalty_settings")
+}
+
+// One account per guest (guests are tenant-scoped, so accounts are too).
+// Balances are denormalized from events for fast in-call reads; every change
+// writes a LoyaltyEvent so the ledger stays auditable.
+model LoyaltyAccount {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @db.Uuid
+  guestId            String   @unique @db.Uuid
+  pointsBalance      Int      @default(0)
+  lifetimePoints     Int      @default(0)
+  lifetimeSpendCents Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  guest  Guest          @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  events LoyaltyEvent[]
+
+  @@index([tenantId])
+  @@map("loyalty_accounts")
+}
+
+model LoyaltyEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  accountId String   @db.Uuid
+  // earn | redeem | adjust
+  type      String
+  // Signed points delta (earn > 0, redeem < 0).
+  points    Int
+  orderId   String?  @db.Uuid
+  note      String?
+  // Idempotency (CLAUDE.md rule #7): at most one earn/redeem per order.
+  dedupeKey String?  @unique
+  createdAt DateTime @default(now())
+
+  account LoyaltyAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, createdAt])
+  @@map("loyalty_events")
+}
+
+// ----------------------------------------------------------------------------
+// Notifications
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id         String    @id @default(uuid()) @db.Uuid
+  tenantId   String    @db.Uuid
+  locationId String?   @db.Uuid
+  // sms | email | push | dashboard
+  channel    String
+  // Who it is for: restaurant (its owner or staff) | guest (a caller, about their order).
+  audience   String    @default("restaurant")
+  // requested | sent | failed | skipped_no_consent (no confirmed opt-in; nothing sent)
+  status     String    @default("requested")
+  recipient  String?
+  subject    String?
+  body       String?
+  // Idempotency: external/job id to dedupe redelivered work.
+  dedupeKey  String?   @unique
+  createdAt  DateTime  @default(now())
+  sentAt     DateTime?
+  // What became of it after the provider accepted it. `status` = sent only
+  // ever meant accepted; on 2026-09-14 every text had been undelivered (Twilio
+  // 30034, unregistered 10DLC) while it said sent. Filled by the provider's
+  // delivery callback, matched on providerMessageId.
+  providerMessageId String?   @unique
+  // queued | sent | delivered | undelivered | failed — null until reported
+  deliveryStatus    String?
+  deliveryErrorCode String?
+  deliveryUpdatedAt DateTime?
+
+  @@index([tenantId, createdAt])
+  @@index([locationId, createdAt])
+  @@map("notifications")
+}
+
+// ----------------------------------------------------------------------------
+// POS integrations (Phase 8.4 — CLAUDE.md rule #2: Square is an adapter, not
+// the model). Brayz remains the system of record; the POS is a downstream
+// consumer of an order that is already committed here.
+// ----------------------------------------------------------------------------
+
+model PosIntegration {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @db.Uuid
+  locationId         String   @unique @db.Uuid
+  // manual | square | toast | clover
+  provider           String   @default("manual")
+  enabled            Boolean  @default(true)
+  // Vendor-side location/merchant this Brayz location maps to.
+  externalLocationId String?
+  // sandbox | production
+  environment        String   @default("sandbox")
+  // Vendor OAuth/access token. Cloud SQL is encrypted at rest and this column is
+  // never returned by the API — but it belongs in Secret Manager before a real
+  // merchant connects, with only the secret name stored here.
+  accessToken        String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("pos_integrations")
+}
+
+model PosOrderSync {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  locationId      String    @db.Uuid
+  orderId         String    @unique @db.Uuid
+  provider        String
+  // pending | synced | failed | unsupported
+  status          String    @default("pending")
+  // Vendor's id for the ticket, once it exists.
+  externalOrderId String?
+  attempts        Int       @default(0)
+  lastError       String?
+  // Idempotency (rule #7): one push per order, however often it is retried.
+  dedupeKey       String    @unique
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  syncedAt        DateTime?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, locationId, createdAt])
+  @@map("pos_order_syncs")
+}
+
+/// Idempotency for inbound webhooks (CLAUDE.md rule #7). SiphonAI delivers
+/// at-least-once and replays its spool after a restart, so a delivery id we
+/// have already processed must be a no-op. Not tenant-scoped: the delivery is
+/// identified before we know which call — and therefore which tenant — it is for.
+model WebhookDelivery {
+  id         String   @id @default(uuid()) @db.Uuid
+  // Which sender's id space `eventId` belongs to, e.g. "siphon".
+  source     String
+  eventId    String
+  eventType  String
+  receivedAt DateTime @default(now())
+
+  @@unique([source, eventId])
+  @@index([receivedAt])
+  @@map("webhook_deliveries")
+}
+
+// ----------------------------------------------------------------------------
+// Promotions (Phase 8.1 — plan §12.1 `promotions` / `promotion_redemptions`).
+// A promotion is an offer the bot may mention and apply on a call. Eligibility
+// and the discount are decided by the API, never by the LLM (rule #5): the
+// model is told which promotions apply and reads the result back, it never
+// computes one.
+// ----------------------------------------------------------------------------
+
+model Promotion {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @db.Uuid
+  locationId       String    @db.Uuid
+  /// Short spoken/typed code the guest can ask for, unique per location.
+  /// Null for an offer the bot simply mentions when the guest qualifies.
+  code             String?
+  name             String
+  /// What the bot says when it offers this — kept human, it is read aloud.
+  description      String?
+  // percent_off | amount_off
+  kind             String    @default("amount_off")
+  /// For percent_off: whole percent (1-100). For amount_off: unused.
+  percentOff       Int?
+  /// For amount_off: cents off the order. For percent_off: an optional cap.
+  amountOffCents   Int?
+  /// Order subtotal the promotion needs before it applies at all.
+  minSubtotalCents Int       @default(0)
+  // all | vip | lapsed | birthday — reuses the loyalty rules' definitions so a
+  // restaurant configures "who counts as VIP" in exactly one place.
+  audience         String    @default("all")
+  startsAt         DateTime?
+  endsAt           DateTime?
+  /// Total redemptions allowed across all guests; null = unlimited.
+  maxRedemptions   Int?
+  /// Redemptions allowed per guest. 1 by default — a one-per-customer offer.
+  maxPerGuest      Int       @default(1)
+  active           Boolean   @default(true)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  location    Location              @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  redemptions PromotionRedemption[]
+
+  @@unique([locationId, code])
+  @@index([tenantId, locationId, active])
+  @@map("promotions")
+}
+
+model PromotionRedemption {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  promotionId   String   @db.Uuid
+  guestId       String?  @db.Uuid
+  orderId       String?  @db.Uuid
+  /// What it actually took off, computed by the API at order time.
+  discountCents Int
+  /// Idempotency (rule #7): one redemption per order, however often it retries.
+  dedupeKey     String   @unique
+  createdAt     DateTime @default(now())
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+
+  @@index([promotionId, createdAt])
+  @@index([guestId])
+  @@map("promotion_redemptions")
+}
+
+// ----------------------------------------------------------------------------
+// Billing (Phase 8.5 — plan §12.5, pricing §10). Subscriptions are per
+// LOCATION: the value Brayz delivers is per phone line, so a two-site
+// restaurant pays twice and may sit on different tiers.
+// ----------------------------------------------------------------------------
+
+model LocationSubscription {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenantId             String    @db.Uuid
+  locationId           String    @unique @db.Uuid
+  // starter | growth | pro. Null while a checkout is still incomplete.
+  plan                 String?
+  // none | trialing | active | past_due | canceled | incomplete
+  status               String    @default("none")
+  /// Stripe's ids. The customer outlives any one subscription, so a location
+  /// keeps its invoices and cards across plan changes and re-subscribes.
+  stripeCustomerId     String?
+  stripeSubscriptionId String?   @unique
+  stripeEventCreatedAt DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean   @default(false)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([stripeCustomerId])
+  @@map("location_subscriptions")
+}
+
+/// A restaurant asking Brayz for help.
+///
+/// Tenant-scoped like everything else (rule #1): a customer only ever sees
+/// their own. Brayz staff read them across tenants through /v1/admin, which is
+/// the one place that is allowed to.
+model SupportRequest {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @db.Uuid
+  // The location it is about, when it is about one.
+  locationId  String?   @db.Uuid
+  // Who filed it. Null if the account was deleted since.
+  createdById String?   @db.Uuid
+  subject     String
+  body        String
+  // How much it is hurting them, in their words: low | normal | high | urgent.
+  severity    String    @default("normal")
+  // open | in_progress | resolved
+  status      String    @default("open")
+  // What Brayz staff wrote back. The customer sees this, so it is an answer,
+  // not an internal scratchpad.
+  staffReply  String?
+  repliedAt   DateTime?
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location  Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  createdBy User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([status, createdAt])
+  @@map("support_requests")
+}
+
+/// Who on the Brayz side looked at or changed what, across tenants.
+///
+/// AuditLog cannot serve this: it hangs off a tenant, and the admin portal's
+/// whole point is reading many at once. Every cross-tenant read is recorded
+/// here, so "which of our staff opened this restaurant's data" has an answer.
+model PlatformAuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @db.Uuid
+  // Kept alongside the id so the trail survives the account being deleted.
+  actorEmail String?
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@map("platform_audit_logs")
+}

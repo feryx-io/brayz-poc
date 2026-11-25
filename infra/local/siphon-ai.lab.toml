@@ -1,0 +1,72 @@
+# SiphonAI ↔ Brayz local lab config.
+#
+# Runs the external SiphonAI bridge (github.com/thevoiceguy/siphon-ai) on this
+# box and points its WS leg at the local Orchestrator's media server. A SIP
+# softphone on the LAN (Linphone / Zoiper) registers here and dials the demo
+# restaurant — the whole voice path minus Twilio/PSTN ingress.
+#
+#   export BRAYZ_LAB_SIP_PASSWORD=...      # softphone secret, lab only
+#   siphon-ai --config infra/local/siphon-ai.lab.toml
+#
+# Prereqs: docker compose up (postgres/redis), API on :4000, Orchestrator on
+# :4100, and a phone_numbers row whose e164Number matches what you dial.
+
+[node]
+id = "brayz-lab"
+# The address the softphone (and any registrar callback) must reach — the
+# wildcard bind below can't be advertised in SDP/Contact.
+public_address = "192.168.18.225"
+
+[sip]
+listen = "0.0.0.0:5060"
+transports = ["udp", "tcp"]
+user_agent = "SiphonAI/brayz-lab"
+
+# One credential set covers REGISTER and INVITE. With no [[trunk]] blocks the
+# daemon is in "accept any source" mode, so digest auth is what keeps a random
+# LAN host from dialing the bot.
+[sip.auth]
+enabled = true
+realm = "brayz.lab"
+algorithm = "MD5"          # widest softphone support; lab-only
+[[sip.auth.user]]
+username = "phone1"
+password = "${BRAYZ_LAB_SIP_PASSWORD}"
+
+# Serve REGISTER so a softphone can register to us as its "PBX".
+[registrar]
+enabled = true
+
+[media]
+codecs = ["pcmu", "pcma"]  # G.711 both ways; the bridge transcodes to PCM16LE
+dtmf = "rfc2833"
+# Silero instead of the energy detector: a live handset's room noise fires
+# `speech_started` constantly on "energy", which reads as barge-in.
+vad = "neural"
+rtp_port_range = [40000, 40100]
+
+[bridge]
+# The Brayz Orchestrator's media WebSocket server (services/orchestrator).
+# `?node=` names this bridge on its calls, as the deployed nodes do.
+ws_url = "ws://127.0.0.1:4100/v1/media?node=lab-siphon"
+ws_connect_timeout_ms = 3000
+# Cold STT/LLM/TTS on the first call of a process can exceed the 5 s default
+# before the greeting's first frame lands; 15 s keeps a lab call alive to debug.
+server_start_deadline_secs = 15
+
+# Hold a speech-started for 200 ms while the bot is playing out and only treat
+# it as barge-in if the speech sustains — an echo / background-noise gate. Does
+# not delay a real interruption while the bot is silent.
+[bridge.barge_in]
+debounce_ms = 200
+
+[observability]
+enabled = true
+http_listen = "127.0.0.1:9091"
+
+# Every call bridges to the Orchestrator; it resolves tenant/location from the
+# dialed number (start.to → POST /v1/calls).
+[[route]]
+name = "brayz-ai"
+[route.match]
+any = true

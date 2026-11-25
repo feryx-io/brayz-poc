@@ -1,0 +1,15 @@
+# Build from a clean tree — the image runs npm ci + builds inside.
+**/node_modules
+**/dist
+**/.next
+.git
+.github
+**/*.tfstate
+**/*.tfstate.*
+infra/terraform/**/.terraform
+**/.env
+**/.env.*
+!**/.env.example
+**/coverage
+**/.turbo
+*.log

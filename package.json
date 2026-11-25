@@ -1,0 +1,32 @@
+{
+  "name": "brayz",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Brayz \u2014 AI-powered guest-engagement platform for restaurants",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @brayz/config -w @brayz/shared -w @brayz/db -w @brayz/ai -w @brayz/carriers -w @brayz/pos -w @brayz/billing --if-present && npm run build -w @brayz/api -w @brayz/orchestrator -w @brayz/worker -w @brayz/web --if-present",
+    "dev": "npm run dev --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\"",
+    "db:generate": "npm --workspace @brayz/db run generate",
+    "db:migrate": "npm --workspace @brayz/db run migrate",
+    "db:seed": "npm --workspace @brayz/db run seed"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

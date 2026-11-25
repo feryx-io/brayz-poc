@@ -1,0 +1,86 @@
+# Ops Agent config for the Brayz voice node.
+#
+# SiphonAI logs one JSON object per line (SIPHON_AI_LOG_FORMAT=json), so ship
+# its journal entries through a JSON parse: call_id, route, from_user and the
+# rest arrive in Cloud Logging as jsonPayload fields, not substrings of a text
+# line. Everything else on the box keeps going through the default syslog
+# receiver, minus the daemon's own lines, which would otherwise land twice.
+logging:
+  receivers:
+    siphon_journal:
+      type: systemd_journald
+  processors:
+    siphon_unit_only:
+      type: exclude_logs
+      # NOT ... = rather than != : a journal entry with no _SYSTEMD_UNIT at all
+      # (kernel, early-boot, syslog-forwarded lines) fails a != comparison and
+      # would slip through; NOT = excludes it.
+      match_any:
+        - 'NOT jsonPayload._SYSTEMD_UNIT = "siphon-ai.service"'
+    siphon_parse_json:
+      type: parse_json
+      field: MESSAGE
+      time_key: timestamp
+      time_format: "%Y-%m-%dT%H:%M:%S.%L%z"
+    siphon_severity:
+      type: modify_fields
+      fields:
+        severity:
+          move_from: jsonPayload.level
+          map_values:
+            TRACE: DEBUG
+            DEBUG: DEBUG
+            INFO: INFO
+            WARN: WARNING
+            ERROR: ERROR
+        # Journal bookkeeping that says the same thing on every line. Kept:
+        # _SYSTEMD_UNIT, _PID and _HOSTNAME, which tell one restart from the
+        # next and one node from another.
+        jsonPayload.PRIORITY:
+          omit_if: 'jsonPayload.PRIORITY != ""'
+        jsonPayload.SYSLOG_FACILITY:
+          omit_if: 'jsonPayload.SYSLOG_FACILITY != ""'
+        jsonPayload.SYSLOG_IDENTIFIER:
+          omit_if: 'jsonPayload.SYSLOG_IDENTIFIER != ""'
+        jsonPayload._BOOT_ID:
+          omit_if: 'jsonPayload._BOOT_ID != ""'
+        jsonPayload._CAP_EFFECTIVE:
+          omit_if: 'jsonPayload._CAP_EFFECTIVE != ""'
+        jsonPayload._CMDLINE:
+          omit_if: 'jsonPayload._CMDLINE != ""'
+        jsonPayload._COMM:
+          omit_if: 'jsonPayload._COMM != ""'
+        jsonPayload._EXE:
+          omit_if: 'jsonPayload._EXE != ""'
+        jsonPayload._GID:
+          omit_if: 'jsonPayload._GID != ""'
+        jsonPayload._MACHINE_ID:
+          omit_if: 'jsonPayload._MACHINE_ID != ""'
+        jsonPayload._RUNTIME_SCOPE:
+          omit_if: 'jsonPayload._RUNTIME_SCOPE != ""'
+        jsonPayload._SELINUX_CONTEXT:
+          omit_if: 'jsonPayload._SELINUX_CONTEXT != ""'
+        jsonPayload._STREAM_ID:
+          omit_if: 'jsonPayload._STREAM_ID != ""'
+        jsonPayload._SYSTEMD_CGROUP:
+          omit_if: 'jsonPayload._SYSTEMD_CGROUP != ""'
+        jsonPayload._SYSTEMD_INVOCATION_ID:
+          omit_if: 'jsonPayload._SYSTEMD_INVOCATION_ID != ""'
+        jsonPayload._SYSTEMD_SLICE:
+          omit_if: 'jsonPayload._SYSTEMD_SLICE != ""'
+        jsonPayload._TRANSPORT:
+          omit_if: 'jsonPayload._TRANSPORT != ""'
+        jsonPayload._UID:
+          omit_if: 'jsonPayload._UID != ""'
+    syslog_drop_siphon:
+      type: exclude_logs
+      match_any:
+        - 'jsonPayload.message =~ " siphon-ai\[[0-9]+\]: "'
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [syslog]
+        processors: [syslog_drop_siphon]
+      siphon:
+        receivers: [siphon_journal]
+        processors: [siphon_unit_only, siphon_parse_json, siphon_severity]

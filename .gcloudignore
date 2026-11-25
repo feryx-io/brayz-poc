@@ -1,0 +1,14 @@
+# Keep the Cloud Build upload small — the image rebuilds deps inside.
+.git
+.github
+**/node_modules
+**/dist
+**/.next
+**/coverage
+infra/terraform/**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/.env
+**/.env.*
+!**/.env.example
+*.log

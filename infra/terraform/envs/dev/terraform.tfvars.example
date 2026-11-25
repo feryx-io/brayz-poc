@@ -1,0 +1,49 @@
+# Copy to terraform.tfvars (gitignored) and adjust. project_id/region/zone have sensible
+# defaults in variables.tf; the Twilio ranges are required and have NO default on purpose.
+
+# project_id = "brayz-dev"
+# region     = "us-east4"
+# zone       = "us-east4-a"
+
+# ⚠️ VERIFY BEFORE APPLY — these are a documented starting point and may be stale.
+# Authoritative list: https://www.twilio.com/docs/sip-trunking/ip-addresses
+# If these ranges are wrong, Twilio's inbound SIP/RTP is dropped at the firewall with no
+# obvious error. Prefer narrowing to the specific edge you originate from (e.g. ashburn).
+
+# Twilio SIP *signaling* ranges (the small /30 control-plane blocks):
+twilio_sip_source_ranges = [
+  "54.172.60.0/30",
+  "54.244.51.0/30",
+  "54.171.127.192/30",
+  "35.156.191.128/30",
+  "54.65.63.192/30",
+  "54.169.127.128/30",
+  "54.252.254.64/30",
+  "177.71.206.192/30",
+]
+
+# Twilio *media* (RTP) range. Twilio consolidates media into 168.86.128.0/18; confirm and
+# narrow to your edge's documented subset if you can.
+twilio_media_source_ranges = [
+  "168.86.128.0/18",
+]
+
+# If an instance already exists from before the suffixed naming, adopt it by
+# name so Terraform updates it in place instead of replacing it (a replacement
+# destroys the data). Leave unset for a fresh environment, and clear it after a
+# down.sh --destroy so the next build gets a fresh suffixed name.
+# cloudsql_instance_name = "brayz-dev-pg"
+
+# Restaurant texts (new orders, messages taken) go out from each location's own
+# Twilio number. Set a fallback sender only for locations without one, or a
+# Messaging Service (MG...) once the account has A2P 10DLC registration.
+# twilio_sms_from              = "+15185550100"
+# twilio_messaging_service_sid = "MGxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Bootstraps the FIRST Brayz staff admin: these emails get the `admin` platform
+# role on their first /v1/me after signing in. Leave empty once an admin exists —
+# removing an address here does NOT revoke, so it is not how access is managed.
+# platform_admin_emails = "you@brayz.ai,cofounder@brayz.ai"
+
+# Our own domains on the web service (verify each in Search Console first).
+# web_domains = ["brayz.ai", "www.brayz.ai", "dev.brayz.ai"]

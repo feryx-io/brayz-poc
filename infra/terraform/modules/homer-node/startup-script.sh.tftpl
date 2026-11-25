@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Homer collector provisioning. Idempotent — runs on every boot and is the whole
+# install, so a destroyed box comes back identical without anyone remembering
+# the steps. Same posture as the siphon node: nothing is done here by hand.
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+log() { echo "[homer-provision] $*"; }
+
+# --- 1. docker -------------------------------------------------------------
+
+if ! command -v docker >/dev/null 2>&1; then
+  log "installing docker"
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL --retry 5 --retry-delay 3 https://download.docker.com/linux/debian/gpg \
+    -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+else
+  log "docker already installed"
+fi
+
+# --- 2. data disk ----------------------------------------------------------
+
+# Postgres lives on the attached disk so a VM replacement keeps the capture
+# history. Format only if it has never been formatted — this script runs on
+# every boot, and a mkfs on the second run would erase everything.
+DEV=/dev/disk/by-id/google-homer-data
+if [ -b "$DEV" ]; then
+  if ! blkid "$DEV" >/dev/null 2>&1; then
+    log "formatting the data disk (first boot)"
+    mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEV"
+  fi
+  mkdir -p /var/lib/homer
+  grep -q " /var/lib/homer " /etc/fstab || \
+    echo "$DEV /var/lib/homer ext4 discard,defaults,nofail 0 2" >> /etc/fstab
+  mountpoint -q /var/lib/homer || mount /var/lib/homer
+  mkdir -p /var/lib/homer/postgres
+else
+  log "WARNING: no data disk at $DEV — Postgres will use the boot disk and history dies with the VM"
+  mkdir -p /var/lib/homer/postgres
+fi
+
+# --- 3. secrets ------------------------------------------------------------
+
+# Read at boot with the VM's own service account, so nothing sensitive lives in
+# Terraform state, in an image, or in this script.
+log "fetching secrets"
+
+json_str() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+gcp_token="$(curl -fsSL -H 'Metadata-Flavor: Google' \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" |
+  json_str access_token)"
+if [ -z "$gcp_token" ]; then
+  log "ERROR: could not get an access token from the metadata server"
+  exit 1
+fi
+
+read_secret() {
+  local name="$1" b64
+  b64="$(curl -fsSL -H "Authorization: Bearer $gcp_token" \
+    "https://secretmanager.googleapis.com/v1/projects/$(curl -fsSL -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/project/project-id)/secrets/$name/versions/latest:access" \
+    2>/dev/null | json_str data)"
+  [ -n "$b64" ] && echo "$b64" | base64 -d || true
+}
+
+hep_password="$(read_secret "${hep_password_secret}")"
+db_password="$(read_secret "${db_password_secret}")"
+admin_password="$(read_secret "${admin_password_secret}")"
+
+# A collector that accepts anything is worse than one that is off, because it
+# looks like it is enforcing something. Fail loudly rather than quietly.
+if [ -z "$hep_password" ]; then
+  log "ERROR: ${hep_password_secret} has no value — refusing to start an unauthenticated collector"
+  exit 1
+fi
+if [ -z "$db_password" ]; then
+  log "ERROR: ${db_password_secret} has no value"
+  exit 1
+fi
+
+# --- 4. compose ------------------------------------------------------------
+
+install -d -m 0750 /etc/homer
+install -o root -g root -m 0600 /dev/null /etc/homer/.env
+{
+  printf 'HEP_PASSWORD=%s\n' "$hep_password"
+  printf 'HOMER_DB_PASSWORD=%s\n' "$db_password"
+} > /etc/homer/.env
+
+cat > /etc/homer/compose.yaml <<'HOMER_COMPOSE'
+${compose_yaml}
+HOMER_COMPOSE
+
+log "starting the Homer stack"
+docker compose --project-directory /etc/homer -f /etc/homer/compose.yaml --env-file /etc/homer/.env up -d
+
+# --- 5. UI admin password --------------------------------------------------
+
+# The webapp seeds admin/sipcapture on first boot. Rotating it needs the app to
+# have created the schema first, so this is best-effort and re-runs every boot.
+if [ -n "$admin_password" ]; then
+  log "setting the Homer UI admin password"
+  for _ in $(seq 1 30); do
+    if docker compose --project-directory /etc/homer -f /etc/homer/compose.yaml \
+        exec -T homer-db psql -U postgres -d homer_config -c '\dt users' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+  done
+  # homer-app stores a bcrypt hash and resets it through its own CLI. In the
+  # image the binary is /homer-app and the flags are -update-ui-user /
+  # -update-ui-password (homer-app 1.5.3); it finds the database through the
+  # webapp_config.json the entrypoint renders from DB_*. Verified on brayz-dev
+  # 2026-09-11: admin/sipcapture 401s afterwards. The hash lives on the data
+  # disk, so this re-running every boot only re-asserts it.
+  if docker compose --project-directory /etc/homer -f /etc/homer/compose.yaml \
+      exec -T homer-webapp /homer-app \
+        -update-ui-user=admin -update-ui-password="$admin_password" >/dev/null 2>&1; then
+    log "UI admin password set from ${admin_password_secret}"
+  else
+    log "WARNING: could not rotate the UI admin password — it is still the upstream default (admin/sipcapture)"
+  fi
+else
+  log "WARNING: ${admin_password_secret} is empty — the Homer UI is still admin/sipcapture."
+  log "         Acceptable only because this box has no public IP and the UI is IAP-only."
+fi
+
+log "done — UI on :${ui_port} via IAP, HEP on :${hep_port}/udp, retention ${retention_days}d"

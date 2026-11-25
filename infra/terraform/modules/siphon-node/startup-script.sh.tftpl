@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# Siphon-AI voice node provisioning. Idempotent — runs on every boot, and is the
+# whole install: package, config, secret, service. Nothing is done by hand on
+# this box, so a destroyed node (which is what down.sh does on an ordinary
+# pause) comes back identical without anyone remembering the steps.
+#
+# SiphonAI is a separate product (github.com/thevoiceguy/siphon-ai). We install
+# its published Debian package rather than building from source — the release is
+# a static musl binary, so it does not care which Debian this is, and upgrading
+# is a version bump in Terraform instead of a toolchain on the VM.
+set -euo pipefail
+
+VERSION="${siphon_version}"
+DEB="siphon-ai_$${VERSION}-1_amd64.deb"
+BASE="https://github.com/thevoiceguy/siphon-ai/releases/download/v$${VERSION}"
+export DEBIAN_FRONTEND=noninteractive
+
+log() { echo "[siphon-provision] $*"; }
+
+# --- 1. package ------------------------------------------------------------
+
+if [ "$(siphon-ai --version 2>/dev/null | awk '{print $2}')" = "$${VERSION}" ]; then
+  log "siphon-ai $${VERSION} already installed"
+else
+  log "installing siphon-ai $${VERSION}"
+  apt-get update -qq
+  apt-get install -y -qq curl ca-certificates
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL --retry 5 --retry-delay 3 -o "$tmp/$DEB" "$BASE/$DEB"
+  curl -fsSL --retry 5 --retry-delay 3 -o "$tmp/SHA256SUMS" "$BASE/SHA256SUMS"
+
+  # Verify before installing: this is a binary fetched over the network that
+  # then runs as a daemon with the node's secret.
+  ( cd "$tmp" && sha256sum --ignore-missing -c SHA256SUMS )
+
+  # --force-confold: we overwrite the packaged config below anyway, and an
+  # upgrade must never stop to ask a question no one is there to answer.
+  apt-get install -y -qq -o Dpkg::Options::=--force-confold "$tmp/$DEB"
+fi
+
+# --- 2. secret -------------------------------------------------------------
+
+# The token the Orchestrator checks on the /v1/media upgrade. Read at boot from
+# Secret Manager with the VM's own service account, so it is never in Terraform
+# state, in an image, or in this script.
+log "fetching secrets"
+
+# Pull one string field out of a JSON response. Google's APIs pretty-print with
+# a space after the colon ("data": "..."), the metadata server does not
+# ("access_token":"..."), and matching only one of those shapes is how the first
+# run of this script decided a populated secret was empty and refused to start.
+json_str() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+gcp_token="$(curl -fsSL -H 'Metadata-Flavor: Google' \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" |
+  json_str access_token)"
+if [ -z "$gcp_token" ]; then
+  log "ERROR: could not get an access token from the metadata server"
+  exit 1
+fi
+
+# Read one secret's latest value with the VM's own service account, so nothing
+# sensitive lives in Terraform state, in an image, or in this script.
+#
+# "data" is matched rather than the sibling "dataCrc32c" because the pattern
+# requires the closing quote immediately after the name.
+read_secret() {
+  curl -fsSL -H "Authorization: Bearer $gcp_token" \
+    "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/$1/versions/latest:access" |
+    json_str data | base64 -d
+}
+
+node_token="$(read_secret "${node_token_secret}")"
+if [ -z "$node_token" ]; then
+  # Fail loudly rather than starting a daemon whose every call the Orchestrator
+  # will answer with a 401 — that failure is silent from the caller's side.
+  log "ERROR: ${node_token_secret} has no value; refusing to start"
+  exit 1
+fi
+
+# Signs the lifecycle webhooks the API verifies. Placeholder-seeded secrets are
+# whitespace, so trim before deciding whether we really have one: an unsigned
+# delivery is rejected by the API and the recording never gets a playable URL.
+webhook_secret="$(read_secret "${webhook_secret_name}" | tr -d '[:space:]')"
+if [ -z "$webhook_secret" ]; then
+  log "WARNING: ${webhook_secret_name} is empty — recording webhooks will not be sent"
+fi
+
+%{ if recording.enabled ~}
+# HMAC key for the recording bucket. Empty is survivable: recordings then stay
+# on the node's disk (and the config below is told so) rather than the daemon
+# refusing to start over a feature the call itself does not need.
+recording_access_key="$(read_secret "${recording.access_key_secret}" | tr -d '[:space:]')"
+recording_secret_key="$(read_secret "${recording.secret_key_secret}" | tr -d '[:space:]')"
+if [ -z "$recording_access_key" ] || [ -z "$recording_secret_key" ]; then
+  log "WARNING: recording upload credentials are empty — recordings will stay on the node"
+fi
+%{ endif ~}
+%{ if hep.enabled ~}
+
+# The HEP auth key (chunk 0x0011). An empty value would ship packets a
+# password-checking collector silently discards, so say so rather than leave
+# someone staring at an empty Homer.
+hep_password="$(read_secret "${hep.password_secret}" | tr -d '[:space:]')"
+if [ -z "$hep_password" ]; then
+  log "WARNING: ${hep.password_secret} is empty — the collector will reject these packets"
+fi
+%{ endif ~}
+
+install -o root -g siphon-ai -m 0640 /dev/null /etc/siphon-ai/env
+{
+  printf 'BRAYZ_NODE_SHARED_SECRET=%s\n' "$node_token"
+  printf 'SIPHON_WEBHOOK_SECRET=%s\n' "$webhook_secret"
+%{ if recording.enabled ~}
+  printf 'RECORDING_S3_ACCESS_KEY=%s\n' "$recording_access_key"
+  printf 'RECORDING_S3_SECRET_KEY=%s\n' "$recording_secret_key"
+%{ endif ~}
+%{ if hep.enabled ~}
+  printf 'HEP_PASSWORD=%s\n' "$hep_password"
+%{ endif ~}
+  # One JSON object per line (0.51.0). The Ops Agent config below parses it,
+  # so call_id, route and from_user reach Cloud Logging as fields rather than
+  # substrings of a text line. Text stays the format for reading journalctl on
+  # the box; this daemon's lines leave the box, which is what json is for.
+  printf 'SIPHON_AI_LOG_FORMAT=json\n'
+} > /etc/siphon-ai/env
+
+# --- 3. config -------------------------------------------------------------
+
+log "writing config"
+install -o root -g siphon-ai -m 0640 /dev/null /etc/siphon-ai/config.toml
+cat > /etc/siphon-ai/config.toml <<'SIPHON_CONFIG'
+${config_toml}
+SIPHON_CONFIG
+%{ if recording.enabled ~}
+if [ -z "$recording_access_key" ] || [ -z "$recording_secret_key" ]; then
+  # Keep recording locally but do not hand the daemon empty credentials, which
+  # `check` would refuse and take the voice path down with it.
+  sed -i 's/^enabled      = true # recording-storage$/enabled      = false # recording-storage (no credentials at boot)/' /etc/siphon-ai/config.toml
+fi
+%{ endif ~}
+
+# An unknown key inside [[route]] or [route.*] is a startup error since 0.4x, so
+# check before restarting: a bad config here fails now, with the reason in the
+# serial log, instead of leaving the daemon down after a restart nobody watched.
+log "validating config"
+# The config references $${BRAYZ_NODE_SHARED_SECRET}, which systemd supplies from
+# the EnvironmentFile at start. A manual `check` gets no such thing, so load it
+# here — otherwise validation fails on an unexpanded variable that is actually
+# fine, and this script exits before ever starting the daemon.
+set -a
+. /etc/siphon-ai/env
+set +a
+siphon-ai --config /etc/siphon-ai/config.toml check
+
+# `check` creates every directory the config names (recordings, upload spool)
+# so a bad path fails here — but it runs as root, so on a fresh box they come
+# out root-owned and the daemon, which runs as siphon-ai, cannot write them:
+# the first recording fails while the call itself is fine. Hand the state tree
+# to the service user before it starts. Idempotent; the package owns the root
+# of the tree the same way.
+chown -R siphon-ai:siphon-ai /var/lib/siphon-ai
+
+# --- 4. service ------------------------------------------------------------
+
+systemctl daemon-reload
+systemctl enable --now siphon-ai
+systemctl restart siphon-ai
+
+# --- 5. heartbeat to Brayz ---------------------------------------------------
+
+# SiphonAI's /health, /ready and /metrics listen on loopback only, and the API
+# on Cloud Run could not reach this box anyway — so the node reports in. Every
+# 30 s a oneshot posts a health snapshot to /v1/voice-nodes/<id>/heartbeat
+# (node-secret auth), which is what the staff portal shows per node; three
+# missed beats and the portal calls the node down. It only reads: nothing here
+# restarts, drains or reconfigures siphon-ai, and a failed beat is a log line,
+# not a failed unit. Non-fatal to provisioning for the same reason.
+log "installing the Brayz heartbeat"
+cat > /usr/local/bin/brayz-node-heartbeat <<'BRAYZ_HEARTBEAT'
+#!/usr/bin/env bash
+# Brayz node heartbeat — installed by the siphon-node startup script (Terraform).
+# Posts this SiphonAI node's health to the Brayz API. Read-only: it never
+# touches siphon-ai, and a failed beat is only a log line.
+set -u
+API="${api_url}"
+NODE="${node_id}"
+REGION="${region}"
+ENVIRONMENT="${environment}"
+PUBLIC_IP="${public_address}"
+OBS="http://127.0.0.1:9091"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+probe() { curl -s -o /dev/null -m 3 -w '%%{http_code}' "$OBS$1" 2>/dev/null || true; }
+curl -s -m 3 "$OBS/metrics" > "$tmp/metrics" 2>/dev/null || true
+# One unlabelled metric as a JSON number, or null when the daemon does not export it.
+metric() { awk -v n="$1" '$1 == n { v = $2 } END { if (v == "") print "null"; else printf "%d", v }' "$tmp/metrics"; }
+
+service_active=false; [ "$(systemctl is-active siphon-ai 2>/dev/null)" = active ] && service_active=true
+live=false; [ "$(probe /health)" = 200 ] && live=true
+ready=false; [ "$(probe /ready)" = 200 ] && ready=true
+
+version=$(siphon-ai --version 2>/dev/null | awk '{ print $2 }' | tr -cd '0-9A-Za-z.+-')
+uptime=null
+start_us=$(systemctl show siphon-ai -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)
+if [ "$service_active" = true ] && [ "$start_us" -gt 0 ] 2>/dev/null; then
+  uptime=$(awk -v s="$start_us" '{ printf "%d", $1 - s / 1000000 }' /proc/uptime)
+fi
+
+hep=$(metric siphon_ai_hep_collector_up)
+case "$hep" in null) ;; 0) hep=false ;; *) hep=true ;; esac
+calls=$(metric siphon_ai_calls_active); [ "$calls" = null ] && calls=0
+
+load1=$(awk '{ print $1 }' /proc/loadavg)
+cpus=$(nproc)
+mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { if (t > 0) printf "%.1f", (t - a) * 100 / t; else print "null" }' /proc/meminfo)
+disk=$(df -P / | awk 'NR == 2 { sub("%", "", $5); print $5 + 0 }')
+
+pub=null; [ -n "$PUBLIC_IP" ] && pub="\"$PUBLIC_IP\""
+ver=null; [ -n "$version" ] && ver="\"$version\""
+
+body=$(printf '{"activeCalls":%s,"publicIp":%s,"health":{"version":%s,"serviceActive":%s,"live":%s,"ready":%s,"uptimeSeconds":%s,"dialogsActive":%s,"rtpPortPairsAllocated":%s,"rtpPortPairsCapacity":%s,"hepCollectorUp":%s,"webhookSpoolDepth":%s,"recordingSpoolDepth":%s,"load1":%s,"cpus":%s,"memUsedPct":%s,"diskUsedPct":%s}}' \
+  "$calls" "$pub" "$ver" "$service_active" "$live" "$ready" "$uptime" \
+  "$(metric siphon_ai_dialogs_active)" "$(metric siphon_ai_rtp_port_pairs_allocated)" \
+  "$(metric siphon_ai_rtp_port_pairs_capacity)" "$hep" "$(metric siphon_ai_webhook_spool_depth)" \
+  "$(metric siphon_ai_recording_upload_spool_depth)" "$load1" "$cpus" "$mem" "$disk")
+
+# The secret goes in a 0600 header file, never on the command line where any
+# local process could read it from /proc.
+umask 077
+printf 'x-brayz-node-secret: %s\n' "$BRAYZ_NODE_SHARED_SECRET" > "$tmp/auth"
+post() {
+  curl -s -o /dev/null -m 5 -w '%%{http_code}' -X POST -H @"$tmp/auth" \
+    -H 'content-type: application/json' --data "$2" "$API$1" 2>/dev/null || echo 000
+}
+
+code=$(post "/v1/voice-nodes/$NODE/heartbeat" "$body")
+if [ "$code" = 404 ]; then
+  # This node's first beat: introduce it, then beat again.
+  post /v1/voice-nodes/register \
+    "{\"nodeId\":\"$NODE\",\"region\":\"$REGION\",\"environment\":\"$ENVIRONMENT\",\"publicIp\":$pub}" > /dev/null
+  code=$(post "/v1/voice-nodes/$NODE/heartbeat" "$body")
+fi
+[ "$code" = 200 ] || echo "heartbeat not accepted: HTTP $code"
+exit 0
+BRAYZ_HEARTBEAT
+chmod 0755 /usr/local/bin/brayz-node-heartbeat
+
+cat > /etc/systemd/system/brayz-node-heartbeat.service <<'BRAYZ_UNIT'
+[Unit]
+Description=Brayz node heartbeat (SiphonAI health to the Brayz API)
+Wants=network-online.target
+After=network-online.target siphon-ai.service
+
+[Service]
+Type=oneshot
+# The service user can read the env file (group siphon-ai), which holds the
+# node secret the API checks. Root is not needed to read a few probes.
+User=siphon-ai
+EnvironmentFile=/etc/siphon-ai/env
+ExecStart=/usr/local/bin/brayz-node-heartbeat
+NoNewPrivileges=true
+PrivateTmp=true
+BRAYZ_UNIT
+
+cat > /etc/systemd/system/brayz-node-heartbeat.timer <<'BRAYZ_UNIT'
+[Unit]
+Description=Brayz node heartbeat every 30 s
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+BRAYZ_UNIT
+
+systemctl daemon-reload
+systemctl enable --now brayz-node-heartbeat.timer ||
+  log "WARNING: heartbeat timer did not start — the staff portal will show this node as not reporting"
+
+# --- 6. Cloud Ops agent (logs + metrics) -----------------------------------
+
+if ! systemctl is-active --quiet google-cloud-ops-agent; then
+  curl -fsSL https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /tmp/add-ops-agent.sh
+  bash /tmp/add-ops-agent.sh --also-install || true
+fi
+
+# Ship the daemon's journal through a JSON parse (see ops-agent.yaml in the
+# module). Without this the agent's default syslog receiver still carries the
+# lines, but as one opaque text field each. Validate first: a bad config here
+# leaves the agent running on its previous one rather than down, and says why
+# in the serial log. Non-fatal — the voice path does not depend on logging.
+if [ -d /etc/google-cloud-ops-agent ]; then
+  cat > /tmp/ops-agent.yaml <<'OPS_AGENT_CONFIG'
+${ops_agent_yaml}
+OPS_AGENT_CONFIG
+  if /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine -in /tmp/ops-agent.yaml >/dev/null 2>&1; then
+    install -o root -g root -m 0644 /tmp/ops-agent.yaml /etc/google-cloud-ops-agent/config.yaml
+    systemctl restart google-cloud-ops-agent || log "WARNING: ops agent restart failed"
+  else
+    log "WARNING: ops agent config rejected — keeping the previous one"
+  fi
+fi
+
+log "up: $(siphon-ai --version) — systemctl status siphon-ai"

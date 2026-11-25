@@ -1,0 +1,79 @@
+# Homer stack, adapted from SiphonAI's examples/homer-stack/compose.yaml.
+#
+# Differences from that reference, which is explicitly not production-grade:
+#   * passwords come from Secret Manager at boot, not literals in the file
+#   * Postgres data is on the attached disk, so it survives a VM replacement
+#   * partitions are dropped on a retention window (HEP is guest PII)
+#   * the HEP listener binds the VPC interface, not the world
+services:
+  homer-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: $${HOMER_DB_PASSWORD}
+      # homer-app creates homer_config + homer_data itself; this only exists so
+      # the postgres image has an init database to come up with.
+      POSTGRES_DB: homer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d homer"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - /var/lib/homer/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  heplify-server:
+    image: sipcapture/heplify-server:latest
+    depends_on:
+      homer-db:
+        condition: service_healthy
+    # The upstream image's entrypoint is /bin/sh; name the binary so a restart
+    # cannot drop into a shell instead of collecting.
+    entrypoint: ["/root/heplify-server"]
+    environment:
+      HEPLIFYSERVER_HEPADDR: "0.0.0.0:${hep_port}"
+      # The auth key SiphonAI sends as HEP chunk 0x0011 (capture_password).
+      HEPLIFYSERVER_HEPAUTHKEY: $${HEP_PASSWORD}
+      HEPLIFYSERVER_DBSHEMA: "homer7"
+      HEPLIFYSERVER_DBDRIVER: postgres
+      HEPLIFYSERVER_DBADDR: "homer-db:5432"
+      HEPLIFYSERVER_DBUSER: postgres
+      HEPLIFYSERVER_DBPASS: $${HOMER_DB_PASSWORD}
+      HEPLIFYSERVER_DBDATATABLE: homer_data
+      HEPLIFYSERVER_DBCONFTABLE: homer_config
+      # Creates the schema and rotates partitions. Without it the collector
+      # errors on the first packet, having nowhere to write it.
+      HEPLIFYSERVER_DBROTATE: "true"
+      # Retention. Every INVITE here carries a caller's number, so this is the
+      # control that keeps a debugging tool from becoming a phone-number
+      # archive. Partitions older than this are dropped.
+      HEPLIFYSERVER_DBDROPDAYS: "${retention_days}"
+      HEPLIFYSERVER_LOGLVL: info
+      HEPLIFYSERVER_LOGSTD: "true"
+    ports:
+      # Bound to the VPC interface. The VM has no public IP, and the only
+      # firewall rule that reaches this port is the internal-subnet one, so the
+      # voice node can send and nothing else can.
+      - "${hep_port}:${hep_port}/udp"
+    restart: unless-stopped
+
+  homer-webapp:
+    image: sipcapture/webapp:latest
+    depends_on:
+      heplify-server:
+        condition: service_started
+      homer-db:
+        condition: service_healthy
+    environment:
+      DB_HOST: homer-db
+      DB_USER: postgres
+      DB_PASS: $${HOMER_DB_PASSWORD}
+      DB_HOMER_CONFIG: homer_config
+      DB_HOMER_DATA: homer_data
+      HOMER_LOGLEVEL: error
+    ports:
+      # Reachable only through `gcloud compute start-iap-tunnel` — the IAP
+      # firewall rule is the only path to this port.
+      - "${ui_port}:80/tcp"
+    restart: unless-stopped

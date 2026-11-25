@@ -1,0 +1,33 @@
+# Local dev dependencies for Brayz. Postgres is the system of record (pgvector
+# enabled to match Cloud SQL); Redis holds only ephemeral state.
+#
+#   docker compose up -d
+#
+# Postgres is published on Windows localhost:5432 so the Windows Node/Prisma
+# toolchain connects via DATABASE_URL=postgresql://brayz:brayz@localhost:5432/brayz
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: brayz-postgres
+    environment:
+      POSTGRES_USER: brayz
+      POSTGRES_PASSWORD: brayz
+      POSTGRES_DB: brayz
+    ports:
+      - '5432:5432'
+    volumes:
+      - brayz_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U brayz -d brayz']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: brayz-redis
+    ports:
+      - '6379:6379'
+
+volumes:
+  brayz_pgdata:
